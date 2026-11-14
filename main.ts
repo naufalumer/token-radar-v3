@@ -11,7 +11,7 @@
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { boardIssue, buildRadar, dataScript, parseSnapshot } from './lib/model.ts';
+import { boardIssue, buildRadar, dataScript, parseSnapshot, type BoardRow, type RadarData, type Snapshot } from './lib/model.ts';
 import { buildDossier } from './vendor/makefun-board.ts';
 
 const here = fileURLToPath(new URL('.', import.meta.url));
@@ -30,14 +30,19 @@ function arg(name: string, fallback: string): string {
 }
 
 const inputArg = arg('input', '/input');
-const inputFile = inputArg.endsWith('.json') ? inputArg : join(inputArg, 'snapshot.json');
-if (!existsSync(inputFile)) {
-  process.stderr.write(`token radar: no snapshot at ${inputFile}: pass --input <snapshot.json|directory>\n`);
-  process.exit(2);
-}
 const out = arg('output', process.env.MAKEFUN_OUTPUT_DIR ?? '/output');
 
-const snapshot = parseSnapshot(readFileSync(inputFile, 'utf8'));
+/** The snapshot out of `--input`: a snapshot file, or the snapshot.json inside a directory. */
+function readSnapshot(inputArg: string): Snapshot {
+  const inputFile = inputArg.endsWith('.json') ? inputArg : join(inputArg, 'snapshot.json');
+  if (!existsSync(inputFile)) {
+    process.stderr.write(`token radar: no snapshot at ${inputFile}: pass --input <snapshot.json|directory>\n`);
+    process.exit(2);
+  }
+  return parseSnapshot(readFileSync(inputFile, 'utf8'));
+}
+
+const snapshot = readSnapshot(inputArg);
 const { board, radar } = buildRadar(snapshot);
 const issue = boardIssue(board, snapshot);
 if (issue !== null) {
@@ -64,22 +69,33 @@ function copyFiles(from: string, to: string): string[] {
   return copied;
 }
 
-const dashFiles = copyFiles(join(here, 'dashboard'), join(out, 'dashboard'));
-const shots = copyFiles(join(here, 'screenshots'), join(out, 'screenshots'));
-if (dashFiles.length < 3 || !dashFiles.includes('index.html')) {
-  process.stderr.write(`token radar: dashboard/ is missing files: ${dashFiles.join(', ') || '(empty)'}\n`);
-  process.exit(1);
-}
-if (shots.length < 3) {
-  process.stderr.write(`token radar: screenshots/ holds ${shots.length} image${shots.length === 1 ? '' : 's'}: hand in 3, the board, a detail view and a filtered view\n`);
-  process.exit(1);
-}
-for (const name of shots) {
-  if (!IMAGE_NAME.test(name)) {
-    process.stderr.write(`token radar: screenshots/${name}: a name is letters, digits and . _ -, 1 to 128 characters\n`);
+/**
+ * The dashboard and the screenshots into the output, with the gate's own
+ * counts checked: three dashboard files with index.html, three screenshots
+ * with clean names. A missing file here is a failure now, not a rejection
+ * after submit.
+ */
+function copyEntryFiles(here: string, out: string): { dashFiles: string[]; shots: string[] } {
+  const dashFiles = copyFiles(join(here, 'dashboard'), join(out, 'dashboard'));
+  const shots = copyFiles(join(here, 'screenshots'), join(out, 'screenshots'));
+  if (dashFiles.length < 3 || !dashFiles.includes('index.html')) {
+    process.stderr.write(`token radar: dashboard/ is missing files: ${dashFiles.join(', ') || '(empty)'}\n`);
     process.exit(1);
   }
+  if (shots.length < 3) {
+    process.stderr.write(`token radar: screenshots/ holds ${shots.length} image${shots.length === 1 ? '' : 's'}: hand in 3, the board, a detail view and a filtered view\n`);
+    process.exit(1);
+  }
+  for (const name of shots) {
+    if (!IMAGE_NAME.test(name)) {
+      process.stderr.write(`token radar: screenshots/${name}: a name is letters, digits and . _ -, 1 to 128 characters\n`);
+      process.exit(1);
+    }
+  }
+  return { dashFiles, shots };
 }
+
+const { dashFiles, shots } = copyEntryFiles(here, out);
 
 // The dossier is written last: the scorer rebuilds it from this /output and compares bytes.
 const dossierOpts = { text_max_bytes: TEXT_MAX_BYTES, screenshots: SCREENSHOT_CAPS, dashboard: { max_files: 400, max_bytes: 4_194_304 } };
@@ -93,18 +109,35 @@ if (!readFileSync(join(out, 'dossier.json')).equals(Buffer.from(buildDossier(out
   process.exit(1);
 }
 
-const tiltCheck = radar.calibration.tilt_validation;
-const losingCats = tiltCheck.by_category
-  .filter((c) => c.median_ape_sized_pct > c.median_ape_flat_pct)
-  .map((c) => `${c.category} (${c.peers})`);
-const candLine = tiltCheck.candidates
-  .map((c) => `${c.candidate}: median ${c.median_ape_pct.toFixed(1)}%, log ${c.log_mae.toFixed(3)}, within-2x ${c.within2x_pct.toFixed(1)}%`)
-  .join(' | ');
-process.stdout.write(
-  `token radar: ${snapshot.protocols.length} protocols, ${snapshot.watchlist.length} on the watchlist, ${board.length} rows scored (${radar.early_size} early, ${radar.live_size} live set aside)\n` +
-    `token radar: top implied value $${board[0]!.implied_value_usd.toLocaleString('en-US')} (${board[0]!.slug}), median $${board[Math.floor(board.length / 2)]!.implied_value_usd.toLocaleString('en-US')}\n` +
-    `token radar: pooled tilt — slope ${radar.calibration.power_law.slope}, damped ${radar.calibration.power_law.slope_damped}, R2 ${radar.calibration.power_law.r2}, ref TVL $${radar.calibration.power_law.median_tvl_usd.toLocaleString('en-US')}; 5-fold median error ${tiltCheck.median_ape_sized_pct.toFixed(1)}% vs ${tiltCheck.median_ape_flat_pct.toFixed(1)}% flat, Spearman ${tiltCheck.spearman_sized.toFixed(2)} vs ${tiltCheck.spearman_flat.toFixed(2)} flat (${tiltCheck.sized_wins}/${tiltCheck.peers} priced closer)\n` +
-    `token radar: full formula — median error ${tiltCheck.full_median_ape_sized_pct.toFixed(1)}% vs ${tiltCheck.full_median_ape_flat_pct.toFixed(1)}% flat, log error ${tiltCheck.full_log_mae_sized.toFixed(3)} vs ${tiltCheck.full_log_mae_flat.toFixed(3)} flat, within 2x ${tiltCheck.full_within2x_sized_pct.toFixed(1)}% vs ${tiltCheck.full_within2x_flat_pct.toFixed(1)}% flat (${tiltCheck.full_sized_wins}/${tiltCheck.peers} priced closer); tilt loses the median-error comparison in ${losingCats.length} categor${losingCats.length === 1 ? 'y' : 'ies'}${losingCats.length > 0 ? `: ${losingCats.join(', ')}` : ''}\n` +
-    `token radar: candidates — ${candLine}\n` +
-    `token radar: wrote ${join(out, 'board.json')}, ${join(out, 'data.js')}, ${join(out, 'dashboard')} (${dashFiles.length} files), ${join(out, 'screenshots')} (${shots.length} images) and ${join(out, 'dossier.json')}\n`,
-);
+reportSummary(snapshot, board, radar, dashFiles, shots, out);
+
+/**
+ * The run summary on stdout: what was scored, the pooled tilt and both
+ * validations, and where the outputs went. The losing-categories line names
+ * where the tilt loses the median-error comparison, so a reader sees the
+ * tilt's weak corners instead of only its headline win.
+ */
+function reportSummary(
+  snapshot: Snapshot,
+  board: BoardRow[],
+  radar: RadarData,
+  dashFiles: string[],
+  shots: string[],
+  out: string,
+): void {
+  const tiltCheck = radar.calibration.tilt_validation;
+  const losingCats = tiltCheck.by_category
+    .filter((c) => c.median_ape_sized_pct > c.median_ape_flat_pct)
+    .map((c) => `${c.category} (${c.peers})`);
+  const candLine = tiltCheck.candidates
+    .map((c) => `${c.candidate}: median ${c.median_ape_pct.toFixed(1)}%, log ${c.log_mae.toFixed(3)}, within-2x ${c.within2x_pct.toFixed(1)}%`)
+    .join(' | ');
+  process.stdout.write(
+    `token radar: ${snapshot.protocols.length} protocols, ${snapshot.watchlist.length} on the watchlist, ${board.length} rows scored (${radar.early_size} early, ${radar.live_size} live set aside)\n` +
+      `token radar: top implied value $${board[0]!.implied_value_usd.toLocaleString('en-US')} (${board[0]!.slug}), median $${board[Math.floor(board.length / 2)]!.implied_value_usd.toLocaleString('en-US')}\n` +
+      `token radar: pooled tilt — slope ${radar.calibration.power_law.slope}, damped ${radar.calibration.power_law.slope_damped}, R2 ${radar.calibration.power_law.r2}, ref TVL $${radar.calibration.power_law.median_tvl_usd.toLocaleString('en-US')}; 5-fold median error ${tiltCheck.median_ape_sized_pct.toFixed(1)}% vs ${tiltCheck.median_ape_flat_pct.toFixed(1)}% flat, Spearman ${tiltCheck.spearman_sized.toFixed(2)} vs ${tiltCheck.spearman_flat.toFixed(2)} flat (${tiltCheck.sized_wins}/${tiltCheck.peers} priced closer)\n` +
+      `token radar: full formula — median error ${tiltCheck.full_median_ape_sized_pct.toFixed(1)}% vs ${tiltCheck.full_median_ape_flat_pct.toFixed(1)}% flat, log error ${tiltCheck.full_log_mae_sized.toFixed(3)} vs ${tiltCheck.full_log_mae_flat.toFixed(3)} flat, within 2x ${tiltCheck.full_within2x_sized_pct.toFixed(1)}% vs ${tiltCheck.full_within2x_flat_pct.toFixed(1)}% flat (${tiltCheck.full_sized_wins}/${tiltCheck.peers} priced closer); tilt loses the median-error comparison in ${losingCats.length} categor${losingCats.length === 1 ? 'y' : 'ies'}${losingCats.length > 0 ? `: ${losingCats.join(', ')}` : ''}\n` +
+      `token radar: candidates — ${candLine}\n` +
+      `token radar: wrote ${join(out, 'board.json')}, ${join(out, 'data.js')}, ${join(out, 'dashboard')} (${dashFiles.length} files), ${join(out, 'screenshots')} (${shots.length} images) and ${join(out, 'dossier.json')}\n`,
+  );
+}

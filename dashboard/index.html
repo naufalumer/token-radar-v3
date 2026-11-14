@@ -89,6 +89,12 @@
       <thead><tr><th>Rule</th><th class="num">Median error</th><th class="num">Trimmed mean</th><th class="num">Wins / 119</th><th class="num">Spearman</th><th class="num">Log error</th><th class="num">Within 2×</th></tr></thead>
       <tbody id="cand"></tbody>
     </table></div>
+    <h3>Where the tilt wins and loses — by category</h3>
+    <p>Median error per category, flat median vs pooled tilt. A category the tilt loses in is named here, not hidden by the global median — the run summary names the same losing categories.</p>
+    <div class="tablewrap"><table>
+      <thead><tr><th>Category</th><th class="num">Peers</th><th class="num">Median error, flat</th><th class="num">Median error, tilt</th><th class="num">Tilt wins</th><th>Verdict</th></tr></thead>
+      <tbody id="bycat"></tbody>
+    </table></div>
     <h3>Sandbox — move the dials, watch the board re-rank</h3>
     <p>Change a weight and the top 10 re-ranks live, from the same snapshot figures. The board above always shows the published model; this is the reader's what-if. Tilt strength 1 is the published half-strength tilt; 0 is no tilt at all.</p>
     <div class="sandbox">

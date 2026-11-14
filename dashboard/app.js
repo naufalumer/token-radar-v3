@@ -84,6 +84,7 @@ function renderPicks() {
 function renderModelStrip() {
   const v = R.calibration.tilt_validation;
   const pl = R.calibration.power_law;
+  const losing = v.by_category.filter((c) => c.median_ape_sized_pct > c.median_ape_flat_pct).length;
   $('modelstrip').innerHTML =
     `<span class="ms-label">How this board is priced</span>` +
     `<span class="ms-formula">implied = TVL × category median × size tilt × growth × maturity × chain reach</span>` +
@@ -91,7 +92,8 @@ function renderModelStrip() {
     `5-fold check, multiple only: median error ${v.median_ape_sized_pct.toFixed(1)}% vs ${v.median_ape_flat_pct.toFixed(1)}% for the flat median, ` +
     `log error ${v.log_mae_sized.toFixed(3)} vs ${v.log_mae_flat.toFixed(3)}, ${v.sized_wins} of ${v.peers} priced closer. ` +
     `Full formula: median error ${v.full_median_ape_sized_pct.toFixed(1)}%, trimmed mean ${v.full_trimmed_mean_ape_sized_pct.toFixed(1)}% vs ${v.full_trimmed_mean_ape_flat_pct.toFixed(1)}% flat. ` +
-    `Per-category fits were tested and rejected — see The model.</span>`;
+    `Per-category fits were tested and rejected — see The model. ` +
+    `The tilt loses the median-error comparison in ${losing} of ${v.by_category.length} categories, named there.</span>`;
 }
 
 function renderBoard() {
@@ -140,6 +142,25 @@ function renderCalib() {
     <td class="num">${c.within2x_pct.toFixed(1)}%</td>
   </tr>`).join('');
   $('valid').innerHTML = `<strong>The tilt, checked on six metrics:</strong> one pooled regression of log(market cap) on log(TVL) over ${pl.peers} live peers (slope ${pl.slope.toFixed(2)}, R² ${pl.r2.toFixed(2)}, reference TVL ${money(pl.median_tvl_usd)}). A 5-fold check prices each held-out token two ways — the pooled tilt's median error is ${v.median_ape_sized_pct.toFixed(1)}% against ${v.median_ape_flat_pct.toFixed(1)}% for the flat category median, its log-space error ${v.log_mae_sized.toFixed(3)} against ${v.log_mae_flat.toFixed(3)}, and it ranks the held-out tokens at Spearman ${v.spearman_sized.toFixed(2)} against ${v.spearman_flat.toFixed(2)} flat. It prices ${v.sized_wins} of ${v.peers} tokens closer, and ${v.within2x_sized_pct.toFixed(1)}% of them land within twice their true value (flat: ${v.within2x_flat_pct.toFixed(1)}%). <strong>The full formula</strong> (tilt plus growth, maturity and chain reach) is checked the same way: median error ${v.full_median_ape_sized_pct.toFixed(1)}% vs ${v.full_median_ape_flat_pct.toFixed(1)}% flat, trimmed mean ${v.full_trimmed_mean_ape_sized_pct.toFixed(1)}% vs ${v.full_trimmed_mean_ape_flat_pct.toFixed(1)}%, log error ${v.full_log_mae_sized.toFixed(3)} vs ${v.full_log_mae_flat.toFixed(3)}. Pricing from TVL alone is very noisy either way; the tilt is a small, measured edge, so it is applied at half strength and clamped.`;
+  renderByCategory();
+}
+
+/**
+ * The per-category tilt table: median error per category, flat median vs
+ * pooled tilt, with the verdict. A category the tilt loses in is named here,
+ * not hidden by the global median — the same table the run summary draws its
+ * losing-categories line from.
+ */
+function renderByCategory() {
+  const v = R.calibration.tilt_validation;
+  $('bycat').innerHTML = v.by_category.map((c) => {
+    const wins = c.median_ape_sized_pct < c.median_ape_flat_pct;
+    return `<tr>
+    <td>${esc(c.category)}</td><td class="num">${c.peers}</td>
+    <td class="num">${c.median_ape_flat_pct.toFixed(1)}%</td><td class="num">${c.median_ape_sized_pct.toFixed(1)}%</td>
+    <td class="num">${c.sized_wins} / ${c.peers}</td><td>${wins ? 'tilt wins' : 'tilt loses'}</td>
+  </tr>`;
+  }).join('');
 }
 
 /** Split a farm step's trailing "Cost: … Time: …" from its action text. */
@@ -167,6 +188,8 @@ function openDetail(slug) {
   const basis = R.calibration.category_basis.find((c) => c.category === (r.category || 'Uncategorised'));
   const pl = R.calibration.power_law;
   const fitLine = `Size tilt: one pooled fit on all ${pl.peers} live-token peers (slope ${pl.slope.toFixed(2)}, damped ${pl.slope_damped.toFixed(2)}, R² ${pl.r2.toFixed(2)}), measured against the market's median live TVL of ${money(pl.median_tvl_usd)}. Per-category fits were tested and rejected — they lose to this fit on five of six validation checks, so no category carries its own slope.`;
+  const catVal = R.calibration.tilt_validation.by_category.find((c) => c.category === (r.category || 'Uncategorised'));
+  const tiltLine = !catVal ? '' : `<p>In ${esc(r.category || 'Uncategorised')} the tilt ${catVal.median_ape_sized_pct < catVal.median_ape_flat_pct ? 'wins' : 'loses'} the median-error comparison on ${catVal.peers} live-token peer${catVal.peers === 1 ? '' : 's'} (${catVal.median_ape_sized_pct.toFixed(1)}% vs ${catVal.median_ape_flat_pct.toFixed(1)}% flat; ${catVal.sized_wins} of ${catVal.peers} priced closer). See the per-category table in The model.</p>`;
   const basisHtml = !basis ? '' : `
     <h3>Peer basis — the live tokens this multiple stands on</h3>
     <p>${calibFallback(r)
@@ -198,6 +221,7 @@ function openDetail(slug) {
     <div class="bar" style="width:${Math.min(100, (r.implied_value_usd / R.rows[0].implied_value_usd) * 100).toFixed(1)}%"></div>
     Fitted ${r.fitted_multiple.toFixed(3)}× = ${r.category_multiple.toFixed(3)}× ${esc(r.category || 'market')} median × ${r.size_tilt.toFixed(2)} size tilt. The tilt is the pooled fit (${esc(r.size_tilt_basis)}, R² ${r.size_tilt_r2.toFixed(2)}). Base ${money(base)} · the category multiple is ${calibFallback(r) ? 'the whole-market median (too few live-token peers in this category)' : `the median market-cap/TVL of ${calibPeers(r)} live-token peer${calibPeers(r) === 1 ? '' : 's'} in this category`}.</div>
     ${basisHtml}
+    ${tiltLine}
     <h3>Farm plan — seven steps</h3>
     <ol class="steps">${steps}</ol>
     <p class="note">Costs are the plan's own estimates in gas and capital for this protocol's own chain; they move with the chain. Never pay to claim: a real claim costs gas only, from the protocol's own page.</p>`;

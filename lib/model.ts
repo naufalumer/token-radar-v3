@@ -438,27 +438,39 @@ function groupByCategory(peers: SnapshotProtocol[]): [string, SnapshotProtocol[]
   return [...byCategory.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1));
 }
 
+/**
+ * The least-squares line through two equal-length series: slope, intercept and
+ * R squared. One helper for every regression in the file — the pooled fit, the
+ * per-category fits, the within-category slope — so a fix to the maths lands
+ * once instead of in three copies that can drift apart. The accumulators run
+ * in the same order as the inline versions did, so the fitted numbers are
+ * identical, not merely close.
+ */
+function leastSquares(xs: number[], ys: number[]): { slope: number; intercept: number; r2: number } {
+  const n = xs.length;
+  const mx = xs.reduce((a, b) => a + b, 0) / n;
+  const my = ys.reduce((a, b) => a + b, 0) / n;
+  let sxy = 0;
+  let sxx = 0;
+  let ssTot = 0;
+  for (let i = 0; i < n; i++) {
+    sxy += (xs[i]! - mx) * (ys[i]! - my);
+    sxx += (xs[i]! - mx) ** 2;
+    ssTot += (ys[i]! - my) ** 2;
+  }
+  const slope = sxx === 0 ? 1 : sxy / sxx;
+  const intercept = my - slope * mx;
+  let ssRes = 0;
+  for (let i = 0; i < n; i++) ssRes += (ys[i]! - (intercept + slope * xs[i]!)) ** 2;
+  return { slope, intercept, r2: ssTot === 0 ? 0 : 1 - ssRes / ssTot };
+}
+
 /** The least-squares fit of log10(mcap) on log10(TVL), with its R squared. */
 export function fitPowerLaw(peers: SnapshotProtocol[]): { slope: number; r2: number } {
   const xs = peers.map((p) => Math.log10(p.tvl_usd));
   const ys = peers.map((p) => Math.log10(p.mcap_usd!));
-  const mx = xs.reduce((a, b) => a + b, 0) / xs.length;
-  const my = ys.reduce((a, b) => a + b, 0) / ys.length;
-  let sxy = 0;
-  let sxx = 0;
-  for (let i = 0; i < xs.length; i++) {
-    sxy += (xs[i]! - mx) * (ys[i]! - my);
-    sxx += (xs[i]! - mx) ** 2;
-  }
-  const slope = sxx === 0 ? 1 : sxy / sxx;
-  const intercept = my - slope * mx;
-  let ssTot = 0;
-  let ssRes = 0;
-  for (let i = 0; i < xs.length; i++) {
-    ssTot += (ys[i]! - my) ** 2;
-    ssRes += (ys[i]! - (intercept + slope * xs[i]!)) ** 2;
-  }
-  return { slope, r2: ssTot === 0 ? 0 : 1 - ssRes / ssTot };
+  const { slope, r2 } = leastSquares(xs, ys);
+  return { slope, r2 };
 }
 
 /**
@@ -485,21 +497,8 @@ function withinCategorySlope(peers: SnapshotProtocol[]): number {
 
 /** A least-squares slope and R2 from two equal-length series of numbers. */
 function fitPowerLawFromPairs(xs: number[], ys: number[]): { slope: number; r2: number } {
-  const mx = xs.reduce((a, b) => a + b, 0) / xs.length;
-  const my = ys.reduce((a, b) => a + b, 0) / ys.length;
-  let sxy = 0;
-  let sxx = 0;
-  let ssTot = 0;
-  for (let i = 0; i < xs.length; i++) {
-    sxy += (xs[i]! - mx) * (ys[i]! - my);
-    sxx += (xs[i]! - mx) ** 2;
-    ssTot += (ys[i]! - my) ** 2;
-  }
-  const slope = sxx === 0 ? 1 : sxy / sxx;
-  const intercept = my - slope * mx;
-  let ssRes = 0;
-  for (let i = 0; i < xs.length; i++) ssRes += (ys[i]! - (intercept + slope * xs[i]!)) ** 2;
-  return { slope, r2: ssTot === 0 ? 0 : 1 - ssRes / ssTot };
+  const { slope, r2 } = leastSquares(xs, ys);
+  return { slope, r2 };
 }
 
 /**
@@ -561,6 +560,26 @@ function quartile(sorted: number[], q: number): number {
   return sorted[lo]! + (sorted[hi]! - sorted[lo]!) * (pos - lo);
 }
 
+/** The quartiles of a sorted ratio list, rounded the way the dashboard prints them. */
+function ratioQuartiles(sortedRatios: number[]): { q1: number; median: number; q3: number } {
+  return {
+    q1: round4(quartile(sortedRatios, 0.25)),
+    median: round4(median(sortedRatios) ?? 0),
+    q3: round4(quartile(sortedRatios, 0.75)),
+  };
+}
+
+/** One peer's ratio row for the per-category basis table. */
+function peerBasisRow(p: SnapshotProtocol): PeerBasis {
+  return {
+    slug: p.slug,
+    name: p.name,
+    tvl_usd: p.tvl_usd,
+    mcap_usd: p.mcap_usd!,
+    ratio: round4(p.mcap_usd! / p.tvl_usd),
+  };
+}
+
 /**
  * The live-peer basis per category: every peer's ratio, lowest first, with the
  * quartiles of the distribution — the numbers the category median is the middle of.
@@ -570,18 +589,29 @@ export function buildCategoryBasis(peers: SnapshotProtocol[]): CategoryBasis[] {
   for (const [category, list] of groupByCategory(peers)) {
     const sorted = [...list].sort((a, b) => a.mcap_usd! / a.tvl_usd - b.mcap_usd! / b.tvl_usd);
     const ratios = sorted.map((p) => p.mcap_usd! / p.tvl_usd);
+    out.push({ category, peers: sorted.map(peerBasisRow), ...ratioQuartiles(ratios) });
+  }
+  return out;
+}
+
+/**
+ * One multiple per category from the live peers: the median market-cap-to-TVL
+ * ratio where a category has enough peers to trust its own median, else the
+ * whole-market median. Nothing here names a protocol: the table is whatever
+ * the snapshot's market says.
+ */
+function categoryMultiples(peers: SnapshotProtocol[], marketMedian: number, model: ModelConstants): CategoryMultiple[] {
+  const out: CategoryMultiple[] = [];
+  for (const [category, list] of groupByCategory(peers)) {
+    const ratios = list.map((p) => p.mcap_usd! / p.tvl_usd).sort((a, b) => a - b);
+    const med = median(ratios);
+    const fallback = ratios.length < model.min_peers || med === null;
+    const raw = fallback ? marketMedian : med!;
     out.push({
       category,
-      peers: sorted.map((p) => ({
-        slug: p.slug,
-        name: p.name,
-        tvl_usd: p.tvl_usd,
-        mcap_usd: p.mcap_usd!,
-        ratio: round4(p.mcap_usd! / p.tvl_usd),
-      })),
-      q1: round4(quartile(ratios, 0.25)),
-      median: round4(median(ratios) ?? 0),
-      q3: round4(quartile(ratios, 0.75)),
+      multiple: round4(clampMultiple(raw, model)),
+      peers: ratios.length,
+      fallback,
     });
   }
   return out;
@@ -598,20 +628,6 @@ export function calibrate(snapshot: Snapshot, model: ModelConstants = MODEL): Ca
   const sorted = [...peers].sort((a, b) => (a.slug < b.slug ? -1 : 1));
   const allRatios = peers.map((p) => p.mcap_usd! / p.tvl_usd).sort((a, b) => a - b);
   const marketMedian = median(allRatios) ?? 0.2;
-  const categories: CategoryMultiple[] = [];
-  for (const [category, list] of groupByCategory(peers)) {
-    const ratios = list.map((p) => p.mcap_usd! / p.tvl_usd);
-    ratios.sort((a, b) => a - b);
-    const med = median(ratios);
-    const fallback = ratios.length < model.min_peers || med === null;
-    const raw = fallback ? marketMedian : med!;
-    categories.push({
-      category,
-      multiple: round4(Math.min(model.multiple_cap, Math.max(model.multiple_floor, raw))),
-      peers: ratios.length,
-      fallback,
-    });
-  }
   const fit = fitPowerLaw(peers);
   const medianTvl = median(peers.map((p) => p.tvl_usd).sort((a, b) => a - b)) ?? 1;
   const powerLaw: PowerLawFit = {
@@ -624,7 +640,7 @@ export function calibrate(snapshot: Snapshot, model: ModelConstants = MODEL): Ca
   return {
     market_median: round4(marketMedian),
     live_count: peers.length,
-    categories,
+    categories: categoryMultiples(peers, marketMedian, model),
     power_law: powerLaw,
     category_basis: buildCategoryBasis(peers),
     tilt_validation: validateModel(sorted, model, snapshot.as_of),
@@ -637,7 +653,7 @@ function multipleFor(p: SnapshotProtocol, calibration: Calibration, model: Model
   if (found !== undefined) return found;
   return {
     category: p.category ?? 'Uncategorised',
-    multiple: round4(Math.min(model.multiple_cap, Math.max(model.multiple_floor, calibration.market_median))),
+    multiple: round4(clampMultiple(calibration.market_median, model)),
     peers: 0,
     fallback: true,
   };
@@ -650,6 +666,88 @@ interface FoldContext {
   perCatFit: (c: string | null) => { slopeDamped: number; refTvl: number };
   withinSlopeDamped: number;
   model: ModelConstants;
+}
+
+/** The error lists one 5-fold run accumulates, for the summary below. */
+interface ValidationAccumulators {
+  rules: string[];
+  errs: number[][];
+  logErrs: number[][];
+  pairs: [number, number][][];
+  within: number[];
+  wins: number[];
+  fullFlatErrs: number[];
+  fullFlatLog: number[];
+  fullFlatPairs: [number, number][];
+  fullFlatWithin: number;
+  byCatErr: Map<string, { flat: number[]; sized: number[]; wins: number }>;
+  peerCount: number;
+}
+
+/**
+ * The 5-fold check's summary tables from the accumulators: the per-rule
+ * candidate rows, the per-category tilt table, and the flat-vs-sized headline
+ * numbers for the multiple alone and for the full formula. Kept apart from the
+ * fold loop so the loop stays about pricing held-out tokens and this stays
+ * about turning error lists into the numbers the model tab prints. The trimmed
+ * mean sets aside the worst tenth of errors, so one wild token cannot decide
+ * it; the log mean prices an overestimate and an underestimate symmetrically.
+ */
+function summariseValidation(a: ValidationAccumulators): TiltValidation {
+  const trimmedMean = (es: number[]): number => {
+    const s = [...es].sort((x, y) => x - y).slice(0, Math.floor(es.length * 0.9));
+    return round4((s.reduce((sum, e) => sum + e, 0) / s.length) * 100);
+  };
+  const logMean = (es: number[]): number => round4(es.reduce((sum, e) => sum + e, 0) / es.length);
+  const spearOf = (ps: [number, number][]): number =>
+    round4(spearman(ps.map(([v]) => v), ps.map(([, t]) => t)));
+  const withinPct = (n: number): number => round4((n / a.peerCount) * 100);
+  const byCategory: CategoryValidation[] = [...a.byCatErr.entries()]
+    .sort((x, y) => (x[0] < y[0] ? -1 : 1))
+    .map(([category, e]) => ({
+      category,
+      peers: e.flat.length,
+      median_ape_flat_pct: medianPct(e.flat),
+      median_ape_sized_pct: medianPct(e.sized),
+      sized_wins: e.wins,
+    }));
+  const candidates: CandidateCheck[] = a.rules.map((candidate, ri) => ({
+    candidate,
+    median_ape_pct: medianPct(a.errs[ri]!),
+    trimmed_mean_ape_pct: trimmedMean(a.errs[ri]!),
+    wins: a.wins[ri]!,
+    peers: a.peerCount,
+    spearman: spearOf(a.pairs[ri]!),
+    log_mae: logMean(a.logErrs[ri]!),
+    within2x_pct: withinPct(a.within[ri]!),
+  }));
+  return {
+    median_ape_flat_pct: medianPct(a.errs[0]!),
+    median_ape_sized_pct: medianPct(a.errs[1]!),
+    trimmed_mean_ape_flat_pct: trimmedMean(a.errs[0]!),
+    trimmed_mean_ape_sized_pct: trimmedMean(a.errs[1]!),
+    sized_wins: a.wins[1]!,
+    peers: a.peerCount,
+    spearman_flat: spearOf(a.pairs[0]!),
+    spearman_sized: spearOf(a.pairs[1]!),
+    log_mae_flat: logMean(a.logErrs[0]!),
+    log_mae_sized: logMean(a.logErrs[1]!),
+    within2x_flat_pct: withinPct(a.within[0]!),
+    within2x_sized_pct: withinPct(a.within[1]!),
+    full_median_ape_flat_pct: medianPct(a.fullFlatErrs),
+    full_median_ape_sized_pct: medianPct(a.errs[4]!),
+    full_trimmed_mean_ape_flat_pct: trimmedMean(a.fullFlatErrs),
+    full_trimmed_mean_ape_sized_pct: trimmedMean(a.errs[4]!),
+    full_sized_wins: a.wins[4]!,
+    full_spearman_flat: spearOf(a.fullFlatPairs),
+    full_spearman_sized: spearOf(a.pairs[4]!),
+    full_log_mae_flat: logMean(a.fullFlatLog),
+    full_log_mae_sized: logMean(a.logErrs[4]!),
+    full_within2x_flat_pct: withinPct(a.fullFlatWithin),
+    full_within2x_sized_pct: withinPct(a.within[4]!),
+    by_category: byCategory,
+    candidates,
+  };
 }
 
 /**
@@ -680,20 +778,14 @@ export function validateModel(sortedPeers: SnapshotProtocol[], model: ModelConst
   const buildCtx = (train: SnapshotProtocol[]): FoldContext => {
     const trainRatios = train.map((p) => p.mcap_usd! / p.tvl_usd).sort((a, b) => a - b);
     const trainMedian = median(trainRatios) ?? 0.2;
-    const byCat = new Map<string, SnapshotProtocol[]>();
-    for (const p of train) {
-      const k = p.category ?? 'Uncategorised';
-      const list = byCat.get(k) ?? [];
-      list.push(p);
-      byCat.set(k, list);
-    }
+    const byCat = new Map(groupByCategory(train));
     const catMedian = (c: string | null): number => {
       const v = byCat.get(c ?? 'Uncategorised');
       if (v !== undefined && v.length >= model.min_peers) {
         const m = median(v.map((p) => p.mcap_usd! / p.tvl_usd).sort((a, b) => a - b));
-        if (m !== null) return Math.min(model.multiple_cap, Math.max(model.multiple_floor, m));
+        if (m !== null) return clampMultiple(m, model);
       }
-      return Math.min(model.multiple_cap, Math.max(model.multiple_floor, trainMedian));
+      return clampMultiple(trainMedian, model);
     };
     const fit = fitPowerLaw(train);
     const medTvl = median(train.map((p) => p.tvl_usd).sort((a, b) => a - b)) ?? 1;
@@ -731,10 +823,10 @@ export function validateModel(sortedPeers: SnapshotProtocol[], model: ModelConst
     for (const p of test) {
       const med = ctx.catMedian(p.category);
       const flat = p.tvl_usd * med;
-      const pooled = p.tvl_usd * Math.min(1, Math.max(0.02, med * tiltFrom(p.tvl_usd, ctx.pooledFit.slope_damped, ctx.pooledFit.median_tvl_usd, ctx)));
+      const pooled = p.tvl_usd * clampMultiple(med * tiltFrom(p.tvl_usd, ctx.pooledFit.slope_damped, ctx.pooledFit.median_tvl_usd, ctx), ctx.model);
       const fc = ctx.perCatFit(p.category);
-      const percat = p.tvl_usd * Math.min(1, Math.max(0.02, med * tiltFrom(p.tvl_usd, fc.slopeDamped, fc.refTvl, ctx)));
-      const withinPred = p.tvl_usd * Math.min(1, Math.max(0.02, med * tiltFrom(p.tvl_usd, ctx.withinSlopeDamped, ctx.pooledFit.median_tvl_usd, ctx)));
+      const percat = p.tvl_usd * clampMultiple(med * tiltFrom(p.tvl_usd, fc.slopeDamped, fc.refTvl, ctx), ctx.model);
+      const withinPred = p.tvl_usd * clampMultiple(med * tiltFrom(p.tvl_usd, ctx.withinSlopeDamped, ctx.pooledFit.median_tvl_usd, ctx), ctx.model);
       const full = fullFormulaValue(p, med, tiltFrom(p.tvl_usd, ctx.pooledFit.slope_damped, ctx.pooledFit.median_tvl_usd, ctx), ctx.model, asOf);
       const fullFlat = fullFormulaValue(p, med, 1, ctx.model, asOf);
       const preds = [flat, pooled, percat, withinPred, full];
@@ -764,62 +856,55 @@ export function validateModel(sortedPeers: SnapshotProtocol[], model: ModelConst
     }
   }
 
-  const trimmedMean = (es: number[]): number => {
-    const s = [...es].sort((a, b) => a - b).slice(0, Math.floor(es.length * 0.9));
-    return round4((s.reduce((a, b) => a + b, 0) / s.length) * 100);
-  };
-  const logMean = (es: number[]): number => round4(es.reduce((a, b) => a + b, 0) / es.length);
-  const spearOf = (ps: [number, number][]): number =>
-    round4(spearman(ps.map(([v]) => v), ps.map(([, a]) => a)));
-  const withinPct = (n: number): number => round4((n / sortedPeers.length) * 100);
+  return summariseValidation({
+    rules: RULES,
+    errs,
+    logErrs,
+    pairs,
+    within,
+    wins,
+    fullFlatErrs,
+    fullFlatLog,
+    fullFlatPairs,
+    fullFlatWithin,
+    byCatErr,
+    peerCount: sortedPeers.length,
+  });
+}
 
-  const byCategory: CategoryValidation[] = [...byCatErr.entries()]
-    .sort((a, b) => (a[0] < b[0] ? -1 : 1))
-    .map(([category, e]) => ({
-      category,
-      peers: e.flat.length,
-      median_ape_flat_pct: medianPct(e.flat),
-      median_ape_sized_pct: medianPct(e.sized),
-      sized_wins: e.wins,
-    }));
-  const candidates: CandidateCheck[] = RULES.map((candidate, ri) => ({
-    candidate,
-    median_ape_pct: medianPct(errs[ri]!),
-    trimmed_mean_ape_pct: trimmedMean(errs[ri]!),
-    wins: wins[ri]!,
-    peers: sortedPeers.length,
-    spearman: spearOf(pairs[ri]!),
-    log_mae: logMean(logErrs[ri]!),
-    within2x_pct: withinPct(within[ri]!),
-  }));
+/** The three weights that tilt a fitted multiple into an implied value. */
+export interface Multipliers {
+  growthPct: number;
+  growth: number;
+  maturity: number;
+  chain: number;
+  age: number | null;
+}
 
-  return {
-    median_ape_flat_pct: medianPct(errs[0]!),
-    median_ape_sized_pct: medianPct(errs[1]!),
-    trimmed_mean_ape_flat_pct: trimmedMean(errs[0]!),
-    trimmed_mean_ape_sized_pct: trimmedMean(errs[1]!),
-    sized_wins: wins[1]!,
-    peers: sortedPeers.length,
-    spearman_flat: spearOf(pairs[0]!),
-    spearman_sized: spearOf(pairs[1]!),
-    log_mae_flat: logMean(logErrs[0]!),
-    log_mae_sized: logMean(logErrs[1]!),
-    within2x_flat_pct: withinPct(within[0]!),
-    within2x_sized_pct: withinPct(within[1]!),
-    full_median_ape_flat_pct: medianPct(fullFlatErrs),
-    full_median_ape_sized_pct: medianPct(errs[4]!),
-    full_trimmed_mean_ape_flat_pct: trimmedMean(fullFlatErrs),
-    full_trimmed_mean_ape_sized_pct: trimmedMean(errs[4]!),
-    full_sized_wins: wins[4]!,
-    full_spearman_flat: spearOf(fullFlatPairs),
-    full_spearman_sized: spearOf(pairs[4]!),
-    full_log_mae_flat: logMean(fullFlatLog),
-    full_log_mae_sized: logMean(logErrs[4]!),
-    full_within2x_flat_pct: withinPct(fullFlatWithin),
-    full_within2x_sized_pct: withinPct(within[4]!),
-    by_category: byCategory,
-    candidates,
-  };
+/**
+ * A protocol's growth, maturity and chain weights from its own record, in one
+ * place: the shipped pricing, the full-formula validation and the board all
+ * read these three numbers, so a change to a weight lands once instead of in
+ * three copies of the same arithmetic. The age is null when the snapshot's
+ * as-of date is empty (the validation's flat comparison) or the protocol's
+ * listing date is unknown, and the maturity then falls back to the model's
+ * unknown-age days — the same fallback every caller used before.
+ */
+export function multipliersFor(p: SnapshotProtocol, model: ModelConstants, asOf: string = ''): Multipliers {
+  const growthPct = Math.min(model.growth_cap, Math.max(model.growth_floor, finite(p.change_7d, 0)));
+  const growth = 1 + (growthPct / 100) * model.growth_weight;
+  const age = asOf === '' ? null : ageDays(asOf, p.listed_at);
+  const ageForModel = age ?? model.unknown_age_days;
+  const maturity =
+    model.maturity_floor +
+    (Math.min(Math.max(ageForModel, 0), model.maturity_days) / model.maturity_days) * model.maturity_range;
+  const chain = 1 + Math.min(Math.max(p.chains.length - 1, 0), model.chain_max_extra) * model.chain_step;
+  return { growthPct, growth, maturity, chain, age };
+}
+
+/** A raw multiple held inside the model's floor and cap. */
+function clampMultiple(raw: number, model: ModelConstants): number {
+  return Math.min(model.multiple_cap, Math.max(model.multiple_floor, raw));
 }
 
 /**
@@ -834,16 +919,9 @@ export function fullFormulaValue(
   model: ModelConstants,
   asOf: string = '',
 ): number {
-  const fitted = Math.min(model.multiple_cap, Math.max(model.multiple_floor, categoryMultiple * tilt));
-  const growthPct = Math.min(model.growth_cap, Math.max(model.growth_floor, finite(p.change_7d, 0)));
-  const growthMult = 1 + (growthPct / 100) * model.growth_weight;
-  const age = asOf === '' ? null : ageDays(asOf, p.listed_at);
-  const ageForModel = age ?? model.unknown_age_days;
-  const maturityMult =
-    model.maturity_floor +
-    (Math.min(Math.max(ageForModel, 0), model.maturity_days) / model.maturity_days) * model.maturity_range;
-  const chainMult = 1 + Math.min(Math.max(p.chains.length - 1, 0), model.chain_max_extra) * model.chain_step;
-  return Math.max(1, Math.round(p.tvl_usd * fitted * growthMult * maturityMult * chainMult));
+  const fitted = clampMultiple(categoryMultiple * tilt, model);
+  const m = multipliersFor(p, model, asOf);
+  return Math.max(1, Math.round(p.tvl_usd * fitted * m.growth * m.maturity * m.chain));
 }
 
 /** The multipliers and the implied value one protocol gets under `model`. */
@@ -863,21 +941,13 @@ export function impliedValue(
   chainMult: number;
   age: number | null;
 } {
-  const age = ageDays(asOf, protocol.listed_at);
   const multiple = multipleFor(protocol, calibration, model);
   const tilt = sizeTilt(protocol.tvl_usd, calibration.power_law, model);
-  const fitted = Math.min(model.multiple_cap, Math.max(model.multiple_floor, multiple.multiple * tilt));
-  const rawGrowth = finite(protocol.change_7d, 0);
-  const growthPct = Math.min(model.growth_cap, Math.max(model.growth_floor, rawGrowth));
-  const growthMult = 1 + (growthPct / 100) * model.growth_weight;
-  const ageForModel = age ?? model.unknown_age_days;
-  const maturityMult =
-    model.maturity_floor +
-    (Math.min(Math.max(ageForModel, 0), model.maturity_days) / model.maturity_days) * model.maturity_range;
-  const chainMult = 1 + Math.min(Math.max(protocol.chains.length - 1, 0), model.chain_max_extra) * model.chain_step;
+  const fitted = clampMultiple(multiple.multiple * tilt, model);
+  const m = multipliersFor(protocol, model, asOf);
   const base = protocol.tvl_usd * fitted;
-  const implied = Math.max(1, Math.round(base * growthMult * maturityMult * chainMult));
-  return { implied, multiple, tilt, fitted, growthPct, growthMult, maturityMult, chainMult, age };
+  const implied = Math.max(1, Math.round(base * m.growth * m.maturity * m.chain));
+  return { implied, multiple, tilt, fitted, growthPct: m.growthPct, growthMult: m.growth, maturityMult: m.maturity, chainMult: m.chain, age: m.age };
 }
 
 /** Short human signals derived from the protocol's own figures, for badges in the board. */
@@ -893,29 +963,32 @@ export function signalsFor(p: SnapshotProtocol, age: number | null): string[] {
   return signals;
 }
 
-/** The protocols the board ranks, strongest first, with ranks 1..n. */
-export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): BoardRow[] {
-  const calibration = calibrate(snapshot, model);
+/**
+ * The protocols the board ranks: the watchlist first — the floor, every slug it
+ * names, even one the snapshot no longer carries — then every other rankable
+ * pre-token protocol at any size. No cap on the early radar: a protocol below
+ * the floor is no worse a subject, and the radar exists to find it early.
+ */
+function chooseBoardProtocols(snapshot: Snapshot): SnapshotProtocol[] {
   const index = new Map(snapshot.protocols.map((p) => [p.slug, p]));
   const chosen = new Map<string, SnapshotProtocol>();
-  // The watchlist is the floor: every slug it names, even one the snapshot no longer carries.
   for (const slug of snapshot.watchlist) {
     const p = index.get(slug);
     if (p !== undefined) chosen.set(slug, p);
   }
-  // The early radar: every other rankable pre-token protocol, at any size. No cap: a
-  // protocol below the floor is no worse a subject, and the radar exists to find it early.
   for (const p of snapshot.protocols) {
     if (!chosen.has(p.slug) && isRankable(p)) chosen.set(p.slug, p);
   }
+  return [...chosen.values()];
+}
 
-  const scored = [...chosen.values()].map((p) => {
-    const v = impliedValue(p, snapshot.as_of, calibration, model);
-    return { p, ...v };
-  });
-  scored.sort((a, b) => b.implied - a.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
-  return scored.map((s, i) => ({
-    rank: i + 1,
+/** One protocol with its priced value, ready to become a board row. */
+type ScoredProtocol = ReturnType<typeof impliedValue> & { p: SnapshotProtocol };
+
+/** One scored protocol's board row, at its rank, with the model breakdown attached. */
+function toBoardRow(s: ScoredProtocol, rank: number, tiltR2: number): BoardRow {
+  return {
+    rank,
     slug: s.p.slug,
     name: s.p.name,
     category: s.p.category,
@@ -936,7 +1009,7 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
       multiple_fallback: s.multiple.fallback,
       size_tilt: round4(s.tilt),
       size_tilt_basis: 'pooled — all live-token peers',
-      size_tilt_r2: calibration.power_law.r2,
+      size_tilt_r2: tiltR2,
       fitted_multiple: round4(s.fitted),
       growth_pct: s.growthPct,
       growth_multiplier: round4(s.growthMult),
@@ -944,7 +1017,18 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
       chain_multiplier: round4(s.chainMult),
     },
     farm_steps: farmSteps(s.p, s.age).map(stepText),
-  }));
+  };
+}
+
+/** The protocols the board ranks, strongest first, with ranks 1..n. */
+export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): BoardRow[] {
+  const calibration = calibrate(snapshot, model);
+  const scored = chooseBoardProtocols(snapshot).map((p) => {
+    const v = impliedValue(p, snapshot.as_of, calibration, model);
+    return { p, ...v };
+  });
+  scored.sort((a, b) => b.implied - a.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
+  return scored.map((s, i) => toBoardRow(s, i + 1, calibration.power_law.r2));
 }
 
 /** A step as one string: its action, then its cost and time, within the gate's 20..600 chars. */
@@ -961,34 +1045,31 @@ function chainOf(p: SnapshotProtocol): string {
 }
 
 /**
- * What one transaction costs on a chain, in dollars of gas: the chain's own fee market,
- * not a flat guess. Ethereum mainnet is an order dearer than an L2 or Solana; a reader
- * farming on Base should not budget mainnet gas.
+ * What one transaction costs, in dollars of gas, by chain family: the chain's
+ * own fee market, not a flat guess. Ethereum mainnet is an order dearer than
+ * an L2 or Solana; a reader farming on Base should not budget mainnet gas.
+ * The first family that names the chain wins; anything unlisted costs $3.
  */
+const GAS_TIERS: { chains: string[]; gas: string }[] = [
+  { chains: ['ethereum'], gas: 'about $12 of gas' },
+  { chains: ['solana', 'sui', 'aptos', 'ton', 'near'], gas: 'about $0.10 of gas' },
+  {
+    chains: [
+      'arbitrum', 'optimism', 'base', 'polygon', 'zksync era', 'linea', 'scroll',
+      'ink', 'unichain', 'mode', 'blast', 'zora', 'world chain', 'soneium', 'abstract',
+    ],
+    gas: 'about $0.50 of gas',
+  },
+  { chains: ['binance', 'avalanche'], gas: 'about $1 of gas' },
+  { chains: ['tron'], gas: 'about $2 of gas' },
+];
+
+/** What one transaction costs on a chain, in dollars of gas. */
 export function gasFor(chain: string): string {
   const c = chain.toLowerCase();
-  if (c === 'ethereum') return 'about $12 of gas';
-  if (c === 'solana' || c === 'sui' || c === 'aptos' || c === 'ton' || c === 'near') return 'about $0.10 of gas';
-  if (
-    c === 'arbitrum' ||
-    c === 'optimism' ||
-    c === 'base' ||
-    c === 'polygon' ||
-    c === 'zksync era' ||
-    c === 'linea' ||
-    c === 'scroll' ||
-    c === 'ink' ||
-    c === 'unichain' ||
-    c === 'mode' ||
-    c === 'blast' ||
-    c === 'zora' ||
-    c === 'world chain' ||
-    c === 'soneium' ||
-    c === 'abstract'
-  )
-    return 'about $0.50 of gas';
-  if (c === 'binance' || c === 'avalanche') return 'about $1 of gas';
-  if (c === 'tron') return 'about $2 of gas';
+  for (const tier of GAS_TIERS) {
+    if (tier.chains.includes(c)) return tier.gas;
+  }
   return 'about $3 of gas';
 }
 
@@ -1012,6 +1093,169 @@ function holdDaysFor(age: number | null, growth: number | null): number {
   return hold;
 }
 
+/** One category family's three recurring farm actions, as text builders. */
+interface FamilyActions {
+  test: (category: string) => boolean;
+  main: (name: string, capital: number, chain: string) => string;
+  second: (name: string, capital: number, chain: string) => string;
+  weekly: (name: string, capital: number, chain: string) => string;
+}
+
+/**
+ * The category families, in the order they are tried — the first family whose
+ * test matches the protocol's category wins, so a category that names two
+ * families (a staking bridge, say) always takes the earlier one. Each family
+ * writes the main position, a second action and the weekly habit for what that
+ * kind of protocol actually does. The family comes from the category's words,
+ * never the protocol's name.
+ */
+const ACTION_FAMILIES: FamilyActions[] = [
+  {
+    test: (c) => c.includes('lend') || c.includes('cdp') || c.includes('collateral'),
+    main: (name, capital, chain) =>
+      `Lend $${capital} of USDC through ${name} on ${chain} and leave the position open so it is counted in every snapshot.`,
+    second: () =>
+      `Borrow $20 of USDC against what you lent, pay it back after a week, and take the small loan out again once a month.`,
+    weekly: () =>
+      `Look at the borrow-to-supply ratio once a week and top up the supply if the position starts drifting toward liquidation.`,
+  },
+  {
+    test: (c) => c.includes('dex') || c.includes('amm') || c.includes('swap'),
+    main: (name, capital, chain) =>
+      `Add $${capital} of liquidity to ${name}'s deepest pool on ${chain} in a narrow range and leave it working.`,
+    second: (name, capital, chain) =>
+      `Trade $25 through ${name} on ${chain} once a week, switching the pair you trade each time.`,
+    weekly: () =>
+      `Move the liquidity range once a week so the position stays inside the band where trading actually happens.`,
+  },
+  {
+    test: (c) => c.includes('bridge'),
+    main: (name, capital, chain) =>
+      `Bridge $${capital} of USDC onto ${chain} through ${name} and put the bridged funds to use in the protocol's app.`,
+    second: () =>
+      `A week later bridge $25 back the other way, then bridge in again, so the record shows both directions.`,
+    weekly: (name, capital, chain) =>
+      `Bridge a small amount through ${name} once a week, flipping the direction each time.`,
+  },
+  {
+    test: (c) => c.includes('stak') || c.includes('restak'),
+    main: (name, capital, chain) =>
+      `Stake $${capital} of the chain's staking asset through ${name} on ${chain} and keep the receipt token in the same wallet.`,
+    second: () =>
+      `Add $25 to the stake once a month and never unstake the whole position in one move.`,
+    weekly: () =>
+      `Check the staking rewards once a week and restake them instead of letting them sit unclaimed.`,
+  },
+  {
+    test: (c) => c.includes('perpetual') || c.includes('derivative') || c.includes('options'),
+    main: (name, capital, chain) =>
+      `Deposit $${capital} of USDC as margin on ${name} on ${chain} and open one small position hedged against the other side.`,
+    second: () =>
+      `Close and reopen a $25 position once a week, leaving the margin in the account between trades.`,
+    weekly: () =>
+      `Flatten the position once a week and open a fresh one, so the account shows steady use instead of a single trade.`,
+  },
+  {
+    test: (c) => c.includes('prediction'),
+    main: (name, capital, chain) =>
+      `Fund $${capital} on ${name} and take one position on a market that settles no sooner than a week out.`,
+    second: () =>
+      `Place one $10 position a week on a different market, and never chase a market that has already resolved.`,
+    weekly: () =>
+      `Close or settle one position a week and open the next on a market about something else entirely.`,
+  },
+  {
+    test: (c) => c.includes('curator') || c.includes('allocator') || c.includes('vault'),
+    main: (name, capital, chain) =>
+      `Deposit $${capital} into a ${name} vault on ${chain} and hold the vault shares without shuffling them around.`,
+    second: () =>
+      `Put another $25 into the same vault once a month and read the vault's allocation report each time you do.`,
+    weekly: () =>
+      `Read the vault's allocation report once a week and note any change of strategy before adding more funds.`,
+  },
+  {
+    test: (c) => c.includes('stable'),
+    main: (name, capital, chain) =>
+      `Mint or deposit $${capital} of the stable asset through ${name} on ${chain} and keep it inside the protocol.`,
+    second: (name, capital, chain) =>
+      `Swap $25 of the stable asset through ${name} once a week and put the proceeds back into the same position.`,
+    weekly: (name, capital, chain) =>
+      `Check the peg once a week and swap a small amount through ${name} to keep the position showing activity.`,
+  },
+  {
+    test: (c) => c.includes('rwa'),
+    main: (name, capital, chain) =>
+      `Mint $${capital} of the protocol's yield-bearing asset on ${chain} and hold it for the full term.`,
+    second: () =>
+      `Add $25 to the position once a month and keep the holding in the same wallet the whole time.`,
+    weekly: () =>
+      `Check the yield accrual once a week and write the balance down in the farm log.`,
+  },
+  {
+    test: (c) => c.includes('insurance'),
+    main: (name, capital, chain) =>
+      `Buy $${capital} of cover from ${name} on ${chain} and keep the policy live for the whole term.`,
+    second: () =>
+      `Renew or extend the cover by $25 before it lapses, and never file a claim you do not genuinely hold.`,
+    weekly: () =>
+      `Check the policy's remaining term once a week so it never lapses without you noticing.`,
+  },
+  {
+    test: (c) => c.includes('yield') || c.includes('leveraged farm') || c.includes('aggregator'),
+    main: (name, capital, chain) =>
+      `Deposit $${capital} of USDC into ${name}'s best-yielding strategy on ${chain} and let it compound.`,
+    second: () =>
+      `Claim the yield once a month and redeposit it, and move $25 between two of its strategies each quarter.`,
+    weekly: () =>
+      `Claim the week's yield and put it back into the same strategy, so the compounding never pauses.`,
+  },
+  {
+    test: (c) => c.includes('launchpad'),
+    main: (name, capital, chain) =>
+      `Stake $${capital} in ${name}'s launch allocation pool on ${chain} and register for the next sale.`,
+    second: () =>
+      `Finish one launch task a week and keep the stake locked until the sale window closes.`,
+    weekly: () =>
+      `Do one launch task a week and check the sale calendar for the next window.`,
+  },
+  {
+    test: (c) => c.includes('payment'),
+    main: (name, capital, chain) =>
+      `Send $${capital} of real payments through ${name} on ${chain} over the next month, split into several small sends.`,
+    second: (name, capital, chain) =>
+      `Send $25 through ${name} once a week to a different recipient each time.`,
+    weekly: (name, capital, chain) =>
+      `Send one real payment through ${name} once a week, changing the amount and the recipient.`,
+  },
+  {
+    test: (c) => c.includes('nft') || c.includes('marketplace'),
+    main: (name, capital, chain) =>
+      `List one item and buy one item worth about $${capital} through ${name} on ${chain}.`,
+    second: (name, capital, chain) =>
+      `Trade one small item a week on ${name} and use the same wallet for every listing.`,
+    weekly: (name, capital, chain) =>
+      `List or buy one small item a week on ${name} and keep the same wallet for every trade.`,
+  },
+  {
+    test: (c) => c.includes('privacy'),
+    main: (name, capital, chain) =>
+      `Move $${capital} through ${name}'s private flow on ${chain} and leave the shielded balance where it is.`,
+    second: () =>
+      `Make one $25 private transfer a week and never empty the shielded balance in a single move.`,
+    weekly: () =>
+      `Make one small private transfer a week and keep the shielded balance above half its peak.`,
+  },
+  {
+    test: (c) => c.includes('chain'),
+    main: (name, capital, chain) =>
+      `Bridge $${capital} to the chain ${name} runs on and use two of its native apps with the same wallet.`,
+    second: () =>
+      `Transact on the chain once a week, alternating a swap, a stake and a vote.`,
+    weekly: () =>
+      `Use one native app on the chain each week, alternating a swap, a stake and a vote.`,
+  },
+];
+
 /**
  * The category family's three recurring actions — the main position, a second
  * action, and the weekly habit — each written for what that kind of protocol
@@ -1020,117 +1264,14 @@ function holdDaysFor(age: number | null, growth: number | null): number {
 function actionsFor(p: SnapshotProtocol, capital: number, chain: string): { main: string; second: string; weekly: string } {
   const c = (p.category ?? '').toLowerCase();
   const name = p.name;
-  if (c.includes('lend') || c.includes('cdp') || c.includes('collateral')) {
-    return {
-      main: `Lend $${capital} of USDC through ${name} on ${chain} and leave the position open so it is counted in every snapshot.`,
-      second: `Borrow $20 of USDC against what you lent, pay it back after a week, and take the small loan out again once a month.`,
-      weekly: `Look at the borrow-to-supply ratio once a week and top up the supply if the position starts drifting toward liquidation.`,
-    };
-  }
-  if (c.includes('dex') || c.includes('amm') || c.includes('swap')) {
-    return {
-      main: `Add $${capital} of liquidity to ${name}'s deepest pool on ${chain} in a narrow range and leave it working.`,
-      second: `Trade $25 through ${name} on ${chain} once a week, switching the pair you trade each time.`,
-      weekly: `Move the liquidity range once a week so the position stays inside the band where trading actually happens.`,
-    };
-  }
-  if (c.includes('bridge')) {
-    return {
-      main: `Bridge $${capital} of USDC onto ${chain} through ${name} and put the bridged funds to use in the protocol's app.`,
-      second: `A week later bridge $25 back the other way, then bridge in again, so the record shows both directions.`,
-      weekly: `Bridge a small amount through ${name} once a week, flipping the direction each time.`,
-    };
-  }
-  if (c.includes('stak') || c.includes('restak')) {
-    return {
-      main: `Stake $${capital} of the chain's staking asset through ${name} on ${chain} and keep the receipt token in the same wallet.`,
-      second: `Add $25 to the stake once a month and never unstake the whole position in one move.`,
-      weekly: `Check the staking rewards once a week and restake them instead of letting them sit unclaimed.`,
-    };
-  }
-  if (c.includes('perpetual') || c.includes('derivative') || c.includes('options')) {
-    return {
-      main: `Deposit $${capital} of USDC as margin on ${name} on ${chain} and open one small position hedged against the other side.`,
-      second: `Close and reopen a $25 position once a week, leaving the margin in the account between trades.`,
-      weekly: `Flatten the position once a week and open a fresh one, so the account shows steady use instead of a single trade.`,
-    };
-  }
-  if (c.includes('prediction')) {
-    return {
-      main: `Fund $${capital} on ${name} and take one position on a market that settles no sooner than a week out.`,
-      second: `Place one $10 position a week on a different market, and never chase a market that has already resolved.`,
-      weekly: `Close or settle one position a week and open the next on a market about something else entirely.`,
-    };
-  }
-  if (c.includes('curator') || c.includes('allocator') || c.includes('vault')) {
-    return {
-      main: `Deposit $${capital} into a ${name} vault on ${chain} and hold the vault shares without shuffling them around.`,
-      second: `Put another $25 into the same vault once a month and read the vault's allocation report each time you do.`,
-      weekly: `Read the vault's allocation report once a week and note any change of strategy before adding more funds.`,
-    };
-  }
-  if (c.includes('stable')) {
-    return {
-      main: `Mint or deposit $${capital} of the stable asset through ${name} on ${chain} and keep it inside the protocol.`,
-      second: `Swap $25 of the stable asset through ${name} once a week and put the proceeds back into the same position.`,
-      weekly: `Check the peg once a week and swap a small amount through ${name} to keep the position showing activity.`,
-    };
-  }
-  if (c.includes('rwa')) {
-    return {
-      main: `Mint $${capital} of the protocol's yield-bearing asset on ${chain} and hold it for the full term.`,
-      second: `Add $25 to the position once a month and keep the holding in the same wallet the whole time.`,
-      weekly: `Check the yield accrual once a week and write the balance down in the farm log.`,
-    };
-  }
-  if (c.includes('insurance')) {
-    return {
-      main: `Buy $${capital} of cover from ${name} on ${chain} and keep the policy live for the whole term.`,
-      second: `Renew or extend the cover by $25 before it lapses, and never file a claim you do not genuinely hold.`,
-      weekly: `Check the policy's remaining term once a week so it never lapses without you noticing.`,
-    };
-  }
-  if (c.includes('yield') || c.includes('leveraged farm') || c.includes('aggregator')) {
-    return {
-      main: `Deposit $${capital} of USDC into ${name}'s best-yielding strategy on ${chain} and let it compound.`,
-      second: `Claim the yield once a month and redeposit it, and move $25 between two of its strategies each quarter.`,
-      weekly: `Claim the week's yield and put it back into the same strategy, so the compounding never pauses.`,
-    };
-  }
-  if (c.includes('launchpad')) {
-    return {
-      main: `Stake $${capital} in ${name}'s launch allocation pool on ${chain} and register for the next sale.`,
-      second: `Finish one launch task a week and keep the stake locked until the sale window closes.`,
-      weekly: `Do one launch task a week and check the sale calendar for the next window.`,
-    };
-  }
-  if (c.includes('payment')) {
-    return {
-      main: `Send $${capital} of real payments through ${name} on ${chain} over the next month, split into several small sends.`,
-      second: `Send $25 through ${name} once a week to a different recipient each time.`,
-      weekly: `Send one real payment through ${name} once a week, changing the amount and the recipient.`,
-    };
-  }
-  if (c.includes('nft') || c.includes('marketplace')) {
-    return {
-      main: `List one item and buy one item worth about $${capital} through ${name} on ${chain}.`,
-      second: `Trade one small item a week on ${name} and use the same wallet for every listing.`,
-      weekly: `List or buy one small item a week on ${name} and keep the same wallet for every trade.`,
-    };
-  }
-  if (c.includes('privacy')) {
-    return {
-      main: `Move $${capital} through ${name}'s private flow on ${chain} and leave the shielded balance where it is.`,
-      second: `Make one $25 private transfer a week and never empty the shielded balance in a single move.`,
-      weekly: `Make one small private transfer a week and keep the shielded balance above half its peak.`,
-    };
-  }
-  if (c.includes('chain')) {
-    return {
-      main: `Bridge $${capital} to the chain ${name} runs on and use two of its native apps with the same wallet.`,
-      second: `Transact on the chain once a week, alternating a swap, a stake and a vote.`,
-      weekly: `Use one native app on the chain each week, alternating a swap, a stake and a vote.`,
-    };
+  for (const family of ACTION_FAMILIES) {
+    if (family.test(c)) {
+      return {
+        main: family.main(name, capital, chain),
+        second: family.second(name, capital, chain),
+        weekly: family.weekly(name, capital, chain),
+      };
+    }
   }
   return {
     main: `Deposit $${capital} of USDC into ${name} on ${chain} and keep the position open so it counts in every snapshot.`,
@@ -1138,6 +1279,98 @@ function actionsFor(p: SnapshotProtocol, capital: number, chain: string): { main
     weekly: `Do one different qualifying action each week — a deposit, a swap, a vote or a claim — and vary it.`,
   };
 }
+
+/** Everything the seven farm steps are built from, computed once per protocol. */
+interface FarmPlan {
+  gas: string;
+  capital: number;
+  hold: number;
+  holdWhy: string;
+  actions: { main: string; second: string; weekly: string };
+  young: boolean;
+}
+
+/**
+ * The farm plan's context: the chain's gas, the position's capital, the hold
+ * in days with its reason, the category family's three actions, and whether
+ * the protocol is young enough for the claim step's warning. The hold is
+ * longer for young and heating-up protocols, shorter for cooling ones.
+ */
+function farmPlanContext(p: SnapshotProtocol, age: number | null): FarmPlan {
+  const chain = chainOf(p);
+  const gas = gasFor(chain);
+  const capital = capitalFor(p);
+  const hold = holdDaysFor(age, p.change_7d);
+  const heating = p.change_7d !== null && p.change_7d >= 20;
+  const cooling = p.change_7d !== null && p.change_7d <= -20;
+  const holdWhy = heating
+    ? ` TVL is up ${p.change_7d!.toFixed(1)}% in seven days, so hold through the attention rather than chasing an entry after the spike.`
+    : cooling
+      ? ` TVL is down ${Math.abs(p.change_7d!).toFixed(1)}% in seven days, so re-check the protocol's TVL every week and leave early if it keeps falling.`
+      : '';
+  return {
+    gas,
+    capital,
+    hold,
+    holdWhy,
+    actions: actionsFor(p, capital, chain),
+    young: age !== null && age < 180,
+  };
+}
+
+/** Step 1 — set up a fresh wallet that holds only the farming funds. */
+const walletStep = (ctx: FarmPlan): FarmStep => ({
+  text: `Open a fresh wallet that holds only the funds you plan to farm, and keep its seed phrase offline on paper.`,
+  cost: `under ${ctx.gas} for the first transaction`,
+  time: '5 minutes',
+});
+
+/** Step 2 — take the main position in the protocol. */
+const mainStep = (ctx: FarmPlan): FarmStep => ({
+  text: ctx.actions.main,
+  cost: `$${ctx.capital} of capital and ${ctx.gas}`,
+  time: '15 minutes to set up',
+});
+
+/** Step 3 — a second, different qualifying action. */
+const secondStep = (ctx: FarmPlan): FarmStep => ({
+  text: ctx.actions.second,
+  cost: `${ctx.gas} each time`,
+  time: '10 minutes a week',
+});
+
+/** Step 4 — the weekly habit that keeps the activity showing. */
+const weeklyStep = (ctx: FarmPlan): FarmStep => ({
+  text: ctx.actions.weekly,
+  cost: `${ctx.gas} a week`,
+  time: '10 minutes a week',
+});
+
+/** Step 5 — hold long enough for the activity to count in more than one snapshot. */
+const holdStep = (ctx: FarmPlan): FarmStep => ({
+  text: `Hold the position for at least ${ctx.hold} days so the activity is counted in more than one snapshot.${ctx.holdWhy}`,
+  cost: `the $${ctx.capital} stays in the position`,
+  time: `${ctx.hold} days`,
+});
+
+/**
+ * Step 6 — claim only from the protocol's own page. A young protocol's claim
+ * page is the one it publishes itself, never a link forwarded to the reader.
+ */
+const claimStep = (ctx: FarmPlan): FarmStep => ({
+  text: ctx.young
+    ? `Before you withdraw, open the protocol's own points or rewards page from the link it publishes and claim only there — a young protocol's claim page is the one it publishes itself, never a link forwarded to you.`
+    : `Before you withdraw, open the protocol's own points or rewards page from the link it publishes and claim only there.`,
+  cost: 'no fee to check, and never pay to claim',
+  time: '10 minutes',
+});
+
+/** Step 7 — write the farm log, so the position can be repeated or unwound. */
+const logStep = (ctx: FarmPlan): FarmStep => ({
+  text: `Write the wallet, the dates and every transaction hash in a farm log so you can repeat the $${ctx.capital} position or unwind it.`,
+  cost: 'nothing but the log',
+  time: '5 minutes',
+});
 
 /**
  * A protocol's farm plan: seven steps, each an action with a cost and a time. The plan is
@@ -1147,58 +1380,8 @@ function actionsFor(p: SnapshotProtocol, capital: number, chain: string): { main
  * young and heating-up protocols, shorter for cooling ones.
  */
 export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
-  const chain = chainOf(p);
-  const gas = gasFor(chain);
-  const capital = capitalFor(p);
-  const hold = holdDaysFor(age, p.change_7d);
-  const actions = actionsFor(p, capital, chain);
-  const young = age !== null && age < 180;
-  const heating = p.change_7d !== null && p.change_7d >= 20;
-  const cooling = p.change_7d !== null && p.change_7d <= -20;
-  const holdWhy = heating
-    ? ` TVL is up ${p.change_7d!.toFixed(1)}% in seven days, so hold through the attention rather than chasing an entry after the spike.`
-    : cooling
-      ? ` TVL is down ${Math.abs(p.change_7d!).toFixed(1)}% in seven days, so re-check the protocol's TVL every week and leave early if it keeps falling.`
-      : '';
-  return [
-    {
-      text: `Open a fresh wallet that holds only the funds you plan to farm, and keep its seed phrase offline on paper.`,
-      cost: `under ${gas} for the first transaction`,
-      time: '5 minutes',
-    },
-    {
-      text: actions.main,
-      cost: `$${capital} of capital and ${gas}`,
-      time: '15 minutes to set up',
-    },
-    {
-      text: actions.second,
-      cost: `${gas} each time`,
-      time: '10 minutes a week',
-    },
-    {
-      text: actions.weekly,
-      cost: `${gas} a week`,
-      time: '10 minutes a week',
-    },
-    {
-      text: `Hold the position for at least ${hold} days so the activity is counted in more than one snapshot.${holdWhy}`,
-      cost: `the $${capital} stays in the position`,
-      time: `${hold} days`,
-    },
-    {
-      text: young
-        ? `Before you withdraw, open the protocol's own points or rewards page from the link it publishes and claim only there — a young protocol's claim page is the one it publishes itself, never a link forwarded to you.`
-        : `Before you withdraw, open the protocol's own points or rewards page from the link it publishes and claim only there.`,
-      cost: 'no fee to check, and never pay to claim',
-      time: '10 minutes',
-    },
-    {
-      text: `Write the wallet, the dates and every transaction hash in a farm log so you can repeat the $${capital} position or unwind it.`,
-      cost: 'nothing but the log',
-      time: '5 minutes',
-    },
-  ];
+  const ctx = farmPlanContext(p, age);
+  return [walletStep(ctx), mainStep(ctx), secondStep(ctx), weeklyStep(ctx), holdStep(ctx), claimStep(ctx), logStep(ctx)];
 }
 
 /** The live-token protocols, by market cap, for the dashboard's Live token view. */
